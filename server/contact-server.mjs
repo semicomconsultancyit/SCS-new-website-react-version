@@ -1,13 +1,58 @@
-import "dotenv/config";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import dotenv from "dotenv";
 import express from "express";
 import cors from "cors";
 import nodemailer from "nodemailer";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.resolve(__dirname, "../.env"), quiet: true });
+
 const app = express();
 const PORT = Number(process.env.MAIL_SERVER_PORT || 8787);
 
-app.use(cors());
+// Configure CORS for both development and production
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    
+    // On Hostinger or production: allow all origins to prevent CORS blocking
+    if (process.env.NODE_ENV === "production") {
+      return callback(null, true);
+    }
+    
+    // Development: allow localhost variants
+    const allowedOrigins = [
+      "http://localhost:8080",
+      "http://localhost:5173",
+      "http://127.0.0.1:8080",
+      "http://127.0.0.1:5173",
+    ];
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(null, true); // Also allow in dev for flexibility
+    }
+  },
+  credentials: true,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Accept"],
+};
+
+app.use(cors(corsOptions));
 app.use(express.json({ limit: "1mb" }));
+app.use((error, _req, res, next) => {
+  if (error instanceof SyntaxError && "body" in error) {
+    return res.status(400).json({
+      ok: false,
+      message: "Invalid request format. Please submit the form again.",
+    });
+  }
+
+  return next(error);
+});
 
 function toSafeText(value) {
   return String(value || "").trim();
@@ -34,7 +79,10 @@ function getTransporter() {
   const pass = process.env.SMTP_PASS;
 
   if (!host || !user || !pass) {
-    const error = new Error("Email service is not configured. Set SMTP_USER and SMTP_PASS in .env.");
+    const error = new Error(
+      "SMTP credentials not configured. On Hostinger: add SMTP_USER and SMTP_PASS in Node.js environment variables panel (not .env file). " +
+      "Required vars: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_SECURE"
+    );
     error.code = "SMTP_CONFIG_MISSING";
     throw error;
   }
@@ -43,8 +91,26 @@ function getTransporter() {
     host,
     port,
     secure,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000,
     auth: { user, pass },
+    logger: true,
+    debug: true,
   });
+}
+
+function withTimeout(promise, milliseconds, message) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error(message);
+      error.code = "EMAIL_SEND_TIMEOUT";
+      reject(error);
+    }, milliseconds);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
 app.get("/api/health", (_req, res) => {
@@ -74,7 +140,7 @@ app.post("/api/contact", async (req, res) => {
     const htmlOrganization = escapeHtml(organization);
     const htmlQuery = escapeHtml(query).replaceAll("\n", "<br/>");
 
-    await transporter.sendMail({
+    await withTimeout(transporter.sendMail({
       from: fromEmail,
       to: adminEmail,
       replyTo: email,
@@ -116,26 +182,61 @@ app.post("/api/contact", async (req, res) => {
           </div>
         </div>
       `,
-    });
+    }), 20000, "Email delivery timed out. Please try again shortly.");
 
-    return res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true, message: "Contact form submitted successfully! We'll get back to you soon." });
   } catch (error) {
     console.error("Contact mail send failed:", error);
 
     if (error?.code === "SMTP_CONFIG_MISSING") {
       return res.status(503).json({
         ok: false,
-        message: "Email service is not configured. Please set SMTP_PASS in .env and restart the mail server.",
+        message: "Email service not configured. On Hostinger, add SMTP_USER, SMTP_PASS, and other SMTP settings to Node.js environment variables panel, not .env file.",
+      });
+    }
+
+    if (error?.code === "EMAIL_SEND_TIMEOUT") {
+      return res.status(504).json({
+        ok: false,
+        message: "Email delivery timed out. If on Hostinger, try changing SMTP_PORT to 587 with SMTP_SECURE=false or verify SMTP credentials.",
+      });
+    }
+
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    
+    // Provide specific guidance for common Hostinger issues
+    if (errorMsg.includes("ECONNREFUSED") || errorMsg.includes("EHOSTUNREACH")) {
+      return res.status(502).json({
+        ok: false,
+        message: "Cannot reach email server. On Hostinger: verify SMTP_HOST is smtp.hostinger.com and SMTP_PORT is 465 (or try 587). Check network access.",
+      });
+    }
+
+    if (errorMsg.includes("Invalid login") || errorMsg.includes("authentication failed")) {
+      return res.status(502).json({
+        ok: false,
+        message: "Email authentication failed. On Hostinger: verify SMTP_USER and SMTP_PASS are correct in Node.js environment variables.",
       });
     }
 
     return res.status(502).json({
       ok: false,
-      message: "Email delivery failed. Please verify the SMTP username and password.",
+      message: "Email delivery failed. Please try again shortly.",
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Mail server running on http://localhost:${PORT}`);
+  const smtpUser = process.env.SMTP_USER || "NOT SET";
+  const smtpHost = process.env.SMTP_HOST || "NOT SET";
+  const smtpPort = process.env.SMTP_PORT || "NOT SET";
+  console.log(`✓ Mail server running on http://localhost:${PORT}`);
+  console.log(`✓ SMTP Host: ${smtpHost}`);
+  console.log(`✓ SMTP Port: ${smtpPort}`);
+  console.log(`✓ SMTP User: ${smtpUser}`);
+  console.log(`✓ Contact API: POST /api/contact`);
+  console.log(`✓ Health check: GET /api/health`);
+  if (process.env.NODE_ENV === "production") {
+    console.log("\n📌 PRODUCTION MODE: Ensure SMTP credentials are set in Node.js environment variables panel on Hostinger, not in .env file");
+  }
 });
